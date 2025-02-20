@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# proto-file: github.com/openconfig/featureprofiles/proto/feature.proto
+# proto-message: FeatureProfile
 
 id {
     name: "system"
-    version: 1
+    version: 2
 }
 
 # Name
@@ -84,7 +87,6 @@ telemetry_path {
     path: "/system/cpus/cpu/state/wait/interval"
 }
 
-
 # Memory
 telemetry_path {
     path: "/system/memory/state/reserved"
@@ -96,19 +98,6 @@ config_path {
 }
 telemetry_path {
     path: "/system/clock/state/timezone-name"
-}
-
-config_path {
-    path: "/system/aaa/authentication/users/user/config/username"
-}
-telemetry_path {
-    path: "/system/aaa/authentication/users/user/state/username"
-}
-config_path {
-    path: "/system/aaa/authentication/users/user/config/ssh-key"
-}
-telemetry_path {
-    path: "/system/aaa/authentication/users/user/state/ssh-key"
 }
 
 # Alarms

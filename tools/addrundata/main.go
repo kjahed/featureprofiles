@@ -5,7 +5,7 @@
 // testkind is one of "ate_tests", "otg_tests", or simply "tests".  If an ATE test is
 // present, it should have the same rundata as the OTG test.
 //
-// The rundata is stored in the rundata_test.go file in the test package.  Other test
+// The rundata is stored in the metadata.textproto file in the test package.  Other test
 // files are left unchanged.
 //
 // Test plan ID and the description are extracted from the README.md, whereas the UUID is
@@ -14,55 +14,59 @@
 package main
 
 import (
-	"errors"
-	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
+
+	"flag"
 
 	"github.com/golang/glog"
+	"github.com/openconfig/featureprofiles/tools/internal/fpciutil"
 )
 
 var (
-	fix = flag.Bool("fix", false, "Update the rundata in tests.  If false, only check if the tests have the most recent rundata.")
+	dir       = flag.String("dir", "", "Directory to search for tests; if not specified, uses the ancestor 'feature' directory.")
+	fix       = flag.Bool("fix", false, "Update the rundata in tests.  If false, only check if the tests have the most recent rundata.")
+	list      = flag.String("list", "", "List the tests in one of the following formats: csv, json")
+	mergejson = flag.String("mergejson", "", "Merge the JSON listing from this JSON file.")
 )
-
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
-}
-
-func featureDir() (string, error) {
-	_, path, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", errors.New("could not detect caller")
-	}
-	newpath := filepath.Dir(path)
-	for newpath != "." && newpath != "/" {
-		featurepath := filepath.Join(newpath, "feature")
-		if isDir(featurepath) {
-			return featurepath, nil
-		}
-		newpath = filepath.Dir(newpath)
-	}
-	return "", fmt.Errorf("feature root not found from %s", path)
-}
 
 func main() {
 	flag.Parse()
 
-	featuredir, err := featureDir()
-	if err != nil {
-		glog.Exitf("Unable to locate feature root: %v", err)
+	featuredir := *dir
+	if featuredir == "" {
+		var err error
+		featuredir, err = fpciutil.FeatureDir()
+		if err != nil {
+			glog.Exitf("Unable to locate feature root: %v", err)
+		}
 	}
 
 	ts := testsuite{}
 	if ok := ts.read(featuredir); !ok {
 		glog.Exitf("Problems found under feature root.  Please make sure test paths follow feature/<feature>/<subfeature>/<testkind>/<testname>/<testname>_test.go and all tests have an accompanying README.md in the test directory.")
+	}
+
+	switch *list {
+	case "":
+		// Not listing, so it's either check-only or fix.  See below.
+	case "csv":
+		if err := listCSV(os.Stdout, featuredir, ts); err != nil {
+			glog.Exitf("Error writing CSV: %v", err)
+		}
+		return
+	case "json":
+		if err := listJSON(os.Stdout, featuredir, ts); err != nil {
+			glog.Exitf("Error writing JSON: %v", err)
+		}
+		return
+	case "testtracker":
+		if err := listTestTracker(os.Stdout, *mergejson, featuredir, ts); err != nil {
+			glog.Exitf("Error writing TestTracker: %v", err)
+		}
+		return
+	default:
+		glog.Exitf("Unknown listing format: %s", *list)
 	}
 
 	if !*fix {

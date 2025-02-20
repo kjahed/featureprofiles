@@ -20,16 +20,18 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/open-traffic-generator/snappi/gosnappi"
+	fpargs "github.com/openconfig/featureprofiles/internal/args"
 	"github.com/openconfig/featureprofiles/internal/attrs"
 	"github.com/openconfig/featureprofiles/internal/deviations"
 	"github.com/openconfig/featureprofiles/internal/fptest"
 	"github.com/openconfig/featureprofiles/internal/gribi"
-	"github.com/openconfig/gribigo/chk"
-	"github.com/openconfig/gribigo/constants"
+	"github.com/openconfig/featureprofiles/internal/otgutils"
+	"github.com/openconfig/featureprofiles/internal/tescale"
 	"github.com/openconfig/gribigo/fluent"
 	"github.com/openconfig/ondatra"
 	"github.com/openconfig/ondatra/gnmi"
@@ -46,29 +48,19 @@ func TestMain(m *testing.M) {
 //
 // The testbed consists of ate:port1 -> dut:port1
 // and dut:port2 -> ate:port2.
-// There are 64 SubInterfaces between dut:port2
+// There are 16 SubInterfaces between dut:port2
 // and ate:port2
 //
 //   - ate:port1 -> dut:port1 subnet 192.0.2.0/30
-//   - ate:port2 -> dut:port2 64 Sub interfaces:
+//   - ate:port2 -> dut:port2 16 Sub interfaces:
 //   - ate:port2.0 -> dut:port2.0 VLAN-ID: 0 subnet 198.51.100.0/30
 //   - ate:port2.1 -> dut:port2.1 VLAN-ID: 1 subnet 198.51.100.4/30
 //   - ate:port2.2 -> dut:port2.2 VLAN-ID: 2 subnet 198.51.100.8/30
 //   - ate:port2.i -> dut:port2.i VLAN-ID i subnet 198.51.100.(4*i)/30
-//   - ate:port2.63 -> dut:port2.63 VLAN-ID 63 subnet 198.51.100.252/30
+//   - ate:port2.16 -> dut:port2.16 VLAN-ID 16 subnet 198.51.100.60/30
 const (
 	ipv4PrefixLen = 30 // ipv4PrefixLen is the ATE and DUT interface IP prefix length.
-	vrf1          = "vrf1"
-	vrf2          = "vrf2"
-	vrf3          = "vrf3"
-	IPBlock1      = "198.18.0.1/18"   // IPBlock1 represents the ipv4 entries in VRF1
-	IPBlock2      = "198.18.64.1/18"  // IPBlock2 represents the ipv4 entries in VRF2
-	IPBlock3      = "198.18.128.1/18" // IPBlock3 represents the ipv4 entries in VRF3
-	nhID1         = 2                 // nhID1 is the starting nh Index for entries in VRF1
-	nhID2         = 1002              // nhID2 is the starting nh Index for entries in VRF2
-	nhID3         = 18502             // nhID3 is the starting nh Index for entries in VRF3
-	tunnelSrcIP   = "198.18.204.1"    // tunnelSrcIP represents Source IP of IPinIP Tunnel
-	tunnelDstIP   = "198.18.208.1"    // tunnelDstIP represents Dest IP of IPinIP Tunnel
+	policyName    = "redirect-to-vrf_t"
 )
 
 var (
@@ -86,310 +78,163 @@ var (
 	}
 )
 
-// entryIndex captures all the parameters required for specifying :
-//
-//			a. number of nextHops in a nextHopGroup
-//	   b. number of IPEntries per nextHopGroup
-type routesParam struct {
-	nhgIndex   int    // nhgIndex is the starting nhg Index for each IPBlock
-	maxNhCount int    // maxNhCount is the max number of nexthops per nextHopGroup
-	maxIPCount int    // maxIPCount is the max numbver of IPs per nextHopGroup
-	vrf        string // vrf represents the name of the vrf string
-	nhID       int    // nhID is the starting nh Index for each nextHop range
+func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
+	dp1 := dut.Port(t, "port1")
+	dp2 := dut.Port(t, "port2")
+	d := &oc.Root{}
+
+	vrfs := []string{deviations.DefaultNetworkInstance(dut), tescale.VRFT, tescale.VRFR, tescale.VRFRD}
+	createVrf(t, dut, vrfs)
+
+	// configure Ethernet interfaces first
+	configureInterfaceDUT(t, d, dut, dp1, "src")
+	configureInterfaceDUT(t, d, dut, dp2, "dst")
+
+	// configure an L3 subinterface without vlan tagging under DUT port#1
+	createSubifDUT(t, d, dut, dp1, 0, 0, dutPort1.IPv4)
+	if deviations.ExplicitInterfaceInDefaultVRF(dut) {
+		fptest.AssignToNetworkInstance(t, dut, dp1.Name(), deviations.DefaultNetworkInstance(dut), 0)
+	}
+
+	applyForwardingPolicy(t, dp1.Name())
+
+	// configure 16 L3 subinterfaces under DUT port#2 and assign them to DEFAULT vrf
+	configureDUTSubIfs(t, d, dut, dp2)
 }
 
-// pushIPv4Entries pushes IP entries in a specified VRF in the target DUT.
-// It uses the parameters from entryIndex and virtualVIPs for programming entries.
-func pushIPv4Entries(t *testing.T, virtualVIPs []string, indices []*routesParam, args *testArgs) {
-
-	IPBlocks := make(map[string][]string)
-	IPBlocks[vrf1] = createIPv4Entries(IPBlock1)
-	IPBlocks[vrf2] = createIPv4Entries(IPBlock2)
-	IPBlocks[vrf3] = createIPv4Entries(IPBlock3)
-	nextHops := make(map[string][]string)
-	nextHops[vrf2] = buildL3NextHops(17500, virtualVIPs)
-	nextHops[vrf1] = virtualVIPs
-	nextHops[vrf3] = IPBlocks[vrf1][:500]
-
-	for _, index := range indices {
-		installEntries(t, IPBlocks[index.vrf], nextHops[index.vrf], *index, args)
-	}
-}
-
-// buildIndexList returns all indices required for installing entries in each VRF.
-func buildIndexList() []*routesParam {
-	index1v4 := &routesParam{nhgIndex: 3, maxNhCount: 10, maxIPCount: 200, vrf: vrf1, nhID: nhID1}
-	index2v4 := &routesParam{nhgIndex: 103, maxNhCount: 35, maxIPCount: 60, vrf: vrf2, nhID: nhID2}
-	index3v4 := &routesParam{nhgIndex: 605, maxNhCount: 1, maxIPCount: 40, vrf: vrf3, nhID: nhID3}
-
-	return []*routesParam{index1v4, index2v4, index3v4}
-}
-
-// buildL3NextHop buids N number of NHs each reference (squentially) an IP from the provided IP block.
-func buildL3NextHops(n int, ips []string) []string {
-	// repeatedNextHops will store the "n" times repeated ips []string
-	repeatedNextHops := []string{}
-	if n > len(ips) {
-		repeatCount := len(ips) / n
-		for min, max := 1, repeatCount; min < max; {
-			repeatedNextHops = append(repeatedNextHops, ips...)
-			min = min + 1
-		}
-		repeatCount = len(ips) % n
-		if repeatCount > 0 {
-			repeatedNextHops = append(repeatedNextHops, ips[:repeatCount]...)
-		}
-	}
-	return repeatedNextHops
-}
-
-// createIPv4Entries creates IPv4 Entries given the totalCount and starting prefix
-func createIPv4Entries(startIP string) []string {
-
-	_, netCIDR, _ := net.ParseCIDR(startIP)
-	netMask := binary.BigEndian.Uint32(netCIDR.Mask)
-	firstIP := binary.BigEndian.Uint32(netCIDR.IP)
-	lastIP := (firstIP & netMask) | (netMask ^ 0xffffffff)
-	entries := []string{}
-	for i := firstIP; i <= lastIP; i++ {
-		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, i)
-
-		entries = append(entries, fmt.Sprint(ip))
-	}
-	return entries
-}
-
-// installEntries installs IPv4 Entries in the VRF with the given nextHops and nextHopGroups using gRIBI.
-func installEntries(t *testing.T, ips []string, nexthops []string, index routesParam, args *testArgs) {
-	nextCount := 0
-	localIndex := index.nhgIndex
-	for i, ateAddr := range nexthops {
-		ind := uint64(index.nhID + i)
-		if index.vrf == "vrf3" {
-			nh := fluent.NextHopEntry().
-				WithNetworkInstance(*deviations.DefaultNetworkInstance).
-				WithIndex(ind).
-				WithIPinIP(tunnelSrcIP, tunnelDstIP).
-				WithDecapsulateHeader(fluent.IPinIP).
-				WithEncapsulateHeader(fluent.IPinIP).
-				WithNextHopNetworkInstance(vrf1).
-				WithElectionID(args.electionID.Low, args.electionID.High)
-			args.client.Modify().AddEntry(t, nh)
-		} else {
-			nh := fluent.NextHopEntry().
-				WithNetworkInstance(*deviations.DefaultNetworkInstance).
-				WithIndex(ind).
-				WithIPAddress(ateAddr).
-				WithElectionID(args.electionID.Low, args.electionID.High)
-			args.client.Modify().AddEntry(t, nh)
-		}
-
-		nhg := fluent.NextHopGroupEntry().
-			WithNetworkInstance(*deviations.DefaultNetworkInstance).
-			WithID(uint64(localIndex)).
-			AddNextHop(ind, uint64(index.maxNhCount)).
-			WithElectionID(args.electionID.Low, args.electionID.High)
-		args.client.Modify().AddEntry(t, nhg)
-		nextCount = nextCount + 1
-		if nextCount == index.maxNhCount {
-			localIndex = localIndex + 1
-			nextCount = 0
-		}
-	}
-	nextCount = 0
-	localIndex = index.nhgIndex
-	for ip := range ips {
-		args.client.Modify().AddEntry(t,
-			fluent.IPv4Entry().
-				WithPrefix(ips[ip]+"/32").
-				WithNetworkInstance(index.vrf).
-				WithNextHopGroup(uint64(localIndex)).
-				WithNextHopGroupNetworkInstance(*deviations.DefaultNetworkInstance))
-		nextCount = nextCount + 1
-		if nextCount == index.maxIPCount {
-			localIndex = localIndex + 1
-			nextCount = 0
-		}
-	}
-
-	time.Sleep(1 * time.Minute)
-	if err := awaitTimeout(args.ctx, args.client, t, 2*time.Minute); err != nil {
-		t.Fatalf("Could not program entries via clientA, got err: %v", err)
-	}
-	gr, err := args.client.Get().
-		WithNetworkInstance(index.vrf).
-		WithAFT(fluent.IPv4).
-		Send()
-	if err != nil {
-		t.Fatalf("got unexpected error from get, got: %v", err)
-	}
-	nextCount = 0
-	for ip := range ips {
-		chk.GetResponseHasEntries(t, gr,
-			fluent.IPv4Entry().
-				WithNetworkInstance(index.vrf).
-				WithNextHopGroup(uint64(index.nhgIndex)).
-				WithPrefix(ips[ip]+"/32"),
-		)
-		nextCount = nextCount + 1
-		if nextCount == index.maxIPCount {
-			index.nhgIndex = index.nhgIndex + 1
-			nextCount = 0
-		}
-	}
-}
-
-// pushDefaultEntries creates NextHopGroup entries using the 64 SubIntf address and creates 1000 IPV4 Entries.
-func pushDefaultEntries(t *testing.T, args *testArgs, nextHops []string) []string {
-	for i := range nextHops {
-		index := uint64(i + 1)
-		args.client.Modify().AddEntry(t,
-			fluent.NextHopEntry().
-				WithNetworkInstance(*deviations.DefaultNetworkInstance).
-				WithIndex(index).
-				WithIPAddress(nextHops[i]).
-				WithElectionID(12, 0))
-
-		args.client.Modify().AddEntry(t,
-			fluent.NextHopGroupEntry().
-				WithNetworkInstance(*deviations.DefaultNetworkInstance).
-				WithID(uint64(2)).
-				AddNextHop(index, 64).
-				WithElectionID(12, 0))
-	}
-	time.Sleep(time.Minute)
-	virtualVIPs := createIPv4Entries("198.18.196.1/22")
-
-	for ip := range virtualVIPs {
-		args.client.Modify().AddEntry(t,
-			fluent.IPv4Entry().
-				WithPrefix(virtualVIPs[ip]+"/32").
-				WithNetworkInstance(*deviations.DefaultNetworkInstance).
-				WithNextHopGroup(uint64(2)).
-				WithElectionID(12, 0))
-	}
-	if err := awaitTimeout(args.ctx, args.client, t, time.Minute); err != nil {
-		t.Fatalf("Could not program entries via clientA, got err: %v", err)
-	}
-
-	for ip := range virtualVIPs {
-		chk.HasResult(t, args.client.Results(t),
-			fluent.OperationResult().
-				WithIPv4Operation(virtualVIPs[ip]+"/32").
-				WithOperationType(constants.Add).
-				WithProgrammingResult(fluent.InstalledInFIB).
-				AsResult(),
-			chk.IgnoreOperationID(),
-		)
-	}
-	return virtualVIPs
-}
-
-// createVrf creates takes in a list of VRF names and creates them on the target devices.
-func createVrf(t *testing.T, dut *ondatra.DUTDevice, d *oc.Root, vrfs []string) {
+// createVrf takes in a list of VRF names and creates them on the target devices.
+func createVrf(t *testing.T, dut *ondatra.DUTDevice, vrfs []string) {
 	for _, vrf := range vrfs {
-		// For non-default VRF, we want to replace the
-		// entire VRF tree so the instance is created.
-		i := d.GetOrCreateNetworkInstance(vrf)
-		i.Type = oc.NetworkInstanceTypes_NETWORK_INSTANCE_TYPE_L3VRF
-		i.GetOrCreateProtocol(oc.PolicyTypes_INSTALL_PROTOCOL_TYPE_STATIC, *deviations.StaticProtocolName)
-		gnmi.Replace(t, dut, gnmi.OC().NetworkInstance(vrf).Config(), i)
-		nip := gnmi.OC().NetworkInstance(vrf)
-		fptest.LogQuery(t, "nonDefaultNI", nip.Config(), gnmi.GetConfig(t, dut, nip.Config()))
+		if vrf != deviations.DefaultNetworkInstance(dut) {
+			// configure non-default VRFs
+			d := &oc.Root{}
+			i := d.GetOrCreateNetworkInstance(vrf)
+			i.Type = oc.NetworkInstanceTypes_NETWORK_INSTANCE_TYPE_L3VRF
+			gnmi.Replace(t, dut, gnmi.OC().NetworkInstance(vrf).Config(), i)
+		} else {
+			// configure DEFAULT vrf
+			fptest.ConfigureDefaultNetworkInstance(t, dut)
+		}
 	}
+	// configure PBF
+	gnmi.Replace(t, dut, gnmi.OC().NetworkInstance(deviations.DefaultNetworkInstance(dut)).PolicyForwarding().Config(), configurePBF(dut))
 }
 
-// pushConfig pushes the configuration generated by this
-// struct to the device using gNMI SetReplace.
-func pushConfig(t *testing.T, dut *ondatra.DUTDevice, dutPort *ondatra.Port, d *oc.Root) {
-	t.Helper()
-
-	iname := dutPort.Name()
-	i := d.GetOrCreateInterface(iname)
-	gnmi.Replace(t, dut, gnmi.OC().Interface(iname).Config(), i)
-
-	if *deviations.ExplicitPortSpeed {
-		fptest.SetPortSpeed(t, dutPort)
-	}
-	if *deviations.ExplicitInterfaceInDefaultVRF {
-		fptest.AssignToNetworkInstance(t, dut, i.GetName(), *deviations.DefaultNetworkInstance, 0)
-	}
+// configurePBF returns a fully configured network-instance PF struct
+func configurePBF(dut *ondatra.DUTDevice) *oc.NetworkInstance_PolicyForwarding {
+	d := &oc.Root{}
+	ni := d.GetOrCreateNetworkInstance(deviations.DefaultNetworkInstance(dut))
+	pf := ni.GetOrCreatePolicyForwarding()
+	vrfPolicy := pf.GetOrCreatePolicy(policyName)
+	vrfPolicy.SetType(oc.Policy_Type_VRF_SELECTION_POLICY)
+	vrfPolicy.GetOrCreateRule(1).GetOrCreateIpv4().SourceAddress = ygot.String(atePort1.IPv4 + "/32")
+	vrfPolicy.GetOrCreateRule(1).GetOrCreateAction().NetworkInstance = ygot.String(tescale.VRFT)
+	return pf
 }
 
-// configureInterfaceDUT configures a single DUT layer 2 port.
-func configureInterfaceDUT(t *testing.T, dutPort *ondatra.Port, d *oc.Root, desc string) {
-	t.Helper()
+// applyForwardingPolicy applies the forwarding policy on the interface.
+func applyForwardingPolicy(t *testing.T, ingressPort string) {
+	t.Logf("Applying forwarding policy on interface %v ... ", ingressPort)
+	d := &oc.Root{}
+	dut := ondatra.DUT(t, "dut")
+	interfaceID := ingressPort
+	if deviations.InterfaceRefInterfaceIDFormat(dut) {
+		interfaceID = ingressPort + ".0"
+	}
+	pfPath := gnmi.OC().NetworkInstance(deviations.DefaultNetworkInstance(dut)).PolicyForwarding().Interface(interfaceID)
+	pfCfg := d.GetOrCreateNetworkInstance(deviations.DefaultNetworkInstance(dut)).GetOrCreatePolicyForwarding().GetOrCreateInterface(interfaceID)
+	pfCfg.ApplyVrfSelectionPolicy = ygot.String(policyName)
+	pfCfg.GetOrCreateInterfaceRef().Interface = ygot.String(ingressPort)
+	pfCfg.GetOrCreateInterfaceRef().Subinterface = ygot.Uint32(0)
+	if deviations.InterfaceRefConfigUnsupported(dut) {
+		pfCfg.InterfaceRef = nil
+	}
+	gnmi.Replace(t, dut, pfPath.Config(), pfCfg)
+}
 
-	i := d.GetOrCreateInterface(dutPort.Name())
+// configureInterfaceDUT configures a single DUT port.
+func configureInterfaceDUT(t *testing.T, d *oc.Root, dut *ondatra.DUTDevice, dutPort *ondatra.Port, desc string) {
+	ifName := dutPort.Name()
+	i := d.GetOrCreateInterface(ifName)
 	i.Description = ygot.String(desc)
 	i.Type = oc.IETFInterfaces_InterfaceType_ethernetCsmacd
-	if *deviations.InterfaceEnabled {
+	if deviations.InterfaceEnabled(dut) {
 		i.Enabled = ygot.Bool(true)
 	}
+	if deviations.ExplicitPortSpeed(dut) {
+		i.GetOrCreateEthernet().PortSpeed = fptest.GetIfSpeed(t, dutPort)
+	}
+	gnmi.Replace(t, dut, gnmi.OC().Interface(ifName).Config(), i)
 	t.Logf("DUT port %s configured", dutPort)
 }
 
-// generateSubIntfPair takes the number of subInterfaces, dut,ate,ports and Ixia topology.
-// It configures ATE/DUT SubInterfaces on the target device
-// It returns a slice of the corresponding ATE IPAddresses.
-func generateSubIntfPair(t *testing.T, top gosnappi.Config, dut *ondatra.DUTDevice, ate *ondatra.ATEDevice, dutPort, atePort *ondatra.Port, d *oc.Root) []string {
-	nextHops := []string{}
-	nextHopCount := 63 // nextHopCount specifies number of nextHop IPs needed.
-	for i := 0; i <= nextHopCount; i++ {
-		vlanID := uint16(i)
-		name := fmt.Sprintf(`dst%d`, i)
-		Index := uint32(i)
-		ateIPv4 := fmt.Sprintf(`198.51.100.%d`, ((4 * i) + 1))
-		dutIPv4 := fmt.Sprintf(`198.51.100.%d`, ((4 * i) + 2))
-		configureSubinterfaceDUT(t, d, dutPort, Index, vlanID, dutIPv4, *deviations.DefaultNetworkInstance)
-		MAC, _ := incrementMAC(atePort1.MAC, i+1)
-		configureATE(t, top, ate, atePort, vlanID, name, MAC, dutIPv4, ateIPv4)
-		nextHops = append(nextHops, ateIPv4)
-	}
-	configureInterfaceDUT(t, dutPort, d, "dst")
-	pushConfig(t, dut, dutPort, d)
-	return nextHops
-}
-
-// configureSubinterfaceDUT configures a single DUT layer 3 sub-interface.
-func configureSubinterfaceDUT(t *testing.T, d *oc.Root, dutPort *ondatra.Port, index uint32, vlanID uint16, dutIPv4 string, vrf string) {
-	t.Helper()
-	if vrf != "" {
-		t.Logf("Put port %s into vrf %s", dutPort.Name(), vrf)
-		d.GetOrCreateNetworkInstance(vrf).GetOrCreateInterface(dutPort.Name())
-	}
-
+// createSubifDUT creates a single L3 subinterface
+func createSubifDUT(t *testing.T, d *oc.Root, dut *ondatra.DUTDevice, dutPort *ondatra.Port, index uint32, vlanID uint16, ipv4Addr string) {
+	ifName := dutPort.Name()
 	i := d.GetOrCreateInterface(dutPort.Name())
 	s := i.GetOrCreateSubinterface(index)
 	if vlanID != 0 {
-		s.GetOrCreateVlan().VlanId = oc.UnionUint16(vlanID)
+		if deviations.DeprecatedVlanID(dut) {
+			s.GetOrCreateVlan().VlanId = oc.UnionUint16(vlanID)
+		} else {
+			s.GetOrCreateVlan().GetOrCreateMatch().GetOrCreateSingleTagged().VlanId = ygot.Uint16(vlanID)
+		}
 	}
-
-	sipv4 := s.GetOrCreateIpv4()
-
-	if *deviations.InterfaceEnabled && !*deviations.IPv4MissingEnabled {
-		sipv4.Enabled = ygot.Bool(true)
-	}
-
-	a := sipv4.GetOrCreateAddress(dutIPv4)
+	s4 := s.GetOrCreateIpv4()
+	a := s4.GetOrCreateAddress(ipv4Addr)
 	a.PrefixLength = ygot.Uint8(uint8(ipv4PrefixLen))
+	if deviations.InterfaceEnabled(dut) && !deviations.IPv4MissingEnabled(dut) {
+		s4.Enabled = ygot.Bool(true)
+	}
+	gnmi.Replace(t, dut, gnmi.OC().Interface(ifName).Subinterface(index).Config(), s)
+}
 
+// configureDUTSubIfs configures 16 DUT subinterfaces on the target device
+func configureDUTSubIfs(t *testing.T, d *oc.Root, dut *ondatra.DUTDevice, dutPort *ondatra.Port) {
+	for i := 0; i < 16; i++ {
+		index := uint32(i)
+		vlanID := uint16(i)
+		if deviations.NoMixOfTaggedAndUntaggedSubinterfaces(dut) {
+			vlanID = uint16(i) + 1
+		}
+		dutIPv4 := fmt.Sprintf(`198.51.100.%d`, (4*i)+2)
+		createSubifDUT(t, d, dut, dutPort, index, vlanID, dutIPv4)
+		if deviations.ExplicitInterfaceInDefaultVRF(dut) {
+			fptest.AssignToNetworkInstance(t, dut, dutPort.Name(), deviations.DefaultNetworkInstance(dut), index)
+		}
+	}
+}
+
+// configureATESubIfs configures 16 ATE subinterfaces on the target device
+// It returns a slice of the corresponding ATE IPAddresses.
+func configureATESubIfs(t *testing.T, top gosnappi.Config, atePort *ondatra.Port, dut *ondatra.DUTDevice) []string {
+	nextHops := []string{}
+	for i := 0; i < 16; i++ {
+		vlanID := uint16(i)
+		if deviations.NoMixOfTaggedAndUntaggedSubinterfaces(dut) {
+			vlanID = uint16(i) + 1
+		}
+		dutIPv4 := fmt.Sprintf(`198.51.100.%d`, (4*i)+2)
+		ateIPv4 := fmt.Sprintf(`198.51.100.%d`, (4*i)+1)
+		name := fmt.Sprintf(`dst%d`, i)
+		mac, _ := incrementMAC(atePort1.MAC, i+1)
+		configureATE(t, top, atePort, vlanID, name, mac, dutIPv4, ateIPv4)
+		nextHops = append(nextHops, ateIPv4)
+	}
+	return nextHops
 }
 
 // configureATE configures a single ATE layer 3 interface.
-func configureATE(t *testing.T, top gosnappi.Config, ate *ondatra.ATEDevice, atePort *ondatra.Port, vlanID uint16, Name, MAC, dutIPv4, ateIPv4 string) {
+func configureATE(t *testing.T, top gosnappi.Config, atePort *ondatra.Port, vlanID uint16, Name, MAC, dutIPv4, ateIPv4 string) {
 	t.Helper()
 
 	dev := top.Devices().Add().SetName(Name + ".Dev")
-	eth := dev.Ethernets().Add().SetName(Name + ".Eth")
-	eth.Connection().SetChoice("port_name")
-	eth.SetPortName(atePort.ID()).SetMac(MAC)
+	eth := dev.Ethernets().Add().SetName(Name + ".Eth").SetMac(MAC)
+	eth.Connection().SetPortName(atePort.ID())
 	if vlanID != 0 {
-		eth.Vlans().Add().SetName(Name).SetId(int32(vlanID))
+		eth.Vlans().Add().SetName(Name).SetId(uint32(vlanID))
 	}
-	eth.Ipv4Addresses().Add().SetName(Name + ".IPv4").SetAddress(ateIPv4).SetGateway(dutIPv4).SetPrefix(int32(atePort1.IPv4Len))
-
+	eth.Ipv4Addresses().Add().SetName(Name + ".IPv4").SetAddress(ateIPv4).SetGateway(dutIPv4).SetPrefix(uint32(atePort1.IPv4Len))
 }
 
 // awaitTimeout calls a fluent client Await, adding a timeout to the context.
@@ -397,16 +242,6 @@ func awaitTimeout(ctx context.Context, c *fluent.GRIBIClient, t testing.TB, time
 	subctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return c.Await(subctx, t)
-}
-
-// testArgs holds the objects needed by a test case.
-type testArgs struct {
-	ctx        context.Context
-	client     *fluent.GRIBIClient
-	dut        *ondatra.DUTDevice
-	ate        *ondatra.ATEDevice
-	top        gosnappi.Config
-	electionID gribi.Uint128
 }
 
 // incrementMAC increments the MAC by i. Returns error if the mac cannot be parsed or overflows the mac address space
@@ -427,28 +262,24 @@ func incrementMAC(mac string, i int) (string, error) {
 }
 
 func TestScaling(t *testing.T) {
-	d := &oc.Root{}
 	dut := ondatra.DUT(t, "dut")
+	overrideScaleParams(dut)
 	ate := ondatra.ATE(t, "ate")
 
 	ctx := context.Background()
-	gribic := dut.RawAPIs().GRIBI().Default(t)
-	dp1 := dut.Port(t, "port1")
+	gribic := dut.RawAPIs().GRIBI(t)
+
 	ap1 := ate.Port(t, "port1")
-	top := ate.OTG().NewConfig(t)
-	top.Ports().Add().SetName(ate.Port(t, "port1").ID())
-	vrfs := []string{*deviations.DefaultNetworkInstance, vrf1, vrf2, vrf3}
-	createVrf(t, dut, d, vrfs)
-	// configure an L3 subinterface of no vlan tagging under DUT port#1
-	configureSubinterfaceDUT(t, d, dp1, 0, 0, dutPort1.IPv4, vrf1)
-	configureInterfaceDUT(t, dp1, d, "src")
-	configureATE(t, top, ate, ap1, 0, "src", atePort1.MAC, dutPort1.IPv4, atePort1.IPv4)
-	pushConfig(t, dut, dp1, d)
 	ap2 := ate.Port(t, "port2")
-	dp2 := dut.Port(t, "port2")
+	top := gosnappi.NewConfig()
+	top.Ports().Add().SetName(ate.Port(t, "port1").ID())
 	top.Ports().Add().SetName(ate.Port(t, "port2").ID())
-	// subIntfIPs is the ATE IPv4 addresses for all the subInterfaces
-	subIntfIPs := generateSubIntfPair(t, top, dut, ate, dp2, ap2, d)
+
+	configureDUT(t, dut)
+
+	configureATE(t, top, ap1, 0, "src", atePort1.MAC, dutPort1.IPv4, atePort1.IPv4)
+	// subIntfIPs is a []string slice with ATE IPv4 addresses for all the subInterfaces
+	subIntfIPs := configureATESubIfs(t, top, ap2, dut)
 	ate.OTG().PushConfig(t, top)
 	ate.OTG().StartProtocols(t)
 
@@ -472,20 +303,108 @@ func TestScaling(t *testing.T) {
 	if err := awaitTimeout(ctx, client, t, time.Minute); err != nil {
 		t.Fatalf("Await got error during session negotiation for clientA: %v", err)
 	}
-	eID := gribi.BecomeLeader(t, client)
+	gribi.BecomeLeader(t, client)
 
-	args := &testArgs{
-		ctx:        ctx,
-		client:     client,
-		dut:        dut,
-		ate:        ate,
-		top:        top,
-		electionID: eID,
+	vrfConfigs := tescale.BuildVRFConfig(dut, subIntfIPs,
+		tescale.Param{
+			V4TunnelCount:         *fpargs.V4TunnelCount,
+			V4TunnelNHGCount:      *fpargs.V4TunnelNHGCount,
+			V4TunnelNHGSplitCount: *fpargs.V4TunnelNHGSplitCount,
+			EgressNHGSplitCount:   *fpargs.EgressNHGSplitCount,
+			V4ReEncapNHGCount:     *fpargs.V4ReEncapNHGCount,
+		},
+	)
+	createFlow(t, ate, top, vrfConfigs[1])
+	var maxEntries int = 10000
+	for _, vrfConfig := range vrfConfigs {
+		entries := append(vrfConfig.NHs, vrfConfig.NHGs...)
+		entries = append(entries, vrfConfig.V4Entries...)
+		// Breaking more than 10k gribi entries from 1 modify operation into multiple
+		// modify operations with 10k entries each.
+		if len(entries) > maxEntries {
+			index := 0
+			for idx := 0; idx < len(entries)/maxEntries; idx++ {
+				client.Modify().AddEntry(t, entries[index:maxEntries+index]...)
+				if err := awaitTimeout(ctx, client, t, 5*time.Minute); err != nil {
+					t.Fatalf("Could not program entries, got err: %v", err)
+				}
+				index += maxEntries
+			}
+			// Program the remaining entries less than 10k in another modify operation.
+			if len(entries)%maxEntries != 0 {
+				client.Modify().AddEntry(t, entries[index:]...)
+				if err := awaitTimeout(ctx, client, t, 5*time.Minute); err != nil {
+					t.Fatalf("Could not program entries, got err: %v", err)
+				}
+			}
+
+		} else {
+			client.Modify().AddEntry(t, entries...)
+			if err := awaitTimeout(ctx, client, t, 5*time.Minute); err != nil {
+				t.Fatalf("Could not program entries, got err: %v", err)
+			}
+		}
+		t.Logf("Created %d NHs, %d NHGs, %d IPv4Entries in %s VRF", len(vrfConfig.NHs), len(vrfConfig.NHGs), len(vrfConfig.V4Entries), vrfConfig.Name)
 	}
-	// nextHops are ipv4 entries used for deriving nextHops for IPBlock1 and IPBlock2
-	nextHops := pushDefaultEntries(t, args, subIntfIPs)
-	// indexList is the metadata of number of NH/NHG/IP count/VRF for each IPBlock
-	indexList := buildIndexList()
-	// pushIPv4Entries builds the scaling topology.
-	pushIPv4Entries(t, nextHops, indexList, args)
+	checkTraffic(t, ate, top)
+}
+
+func createFlow(t *testing.T, ate *ondatra.ATEDevice, top gosnappi.Config, vrfTConf *tescale.VRFConfig) {
+	dstIPs := []string{}
+	for _, v4Entry := range vrfTConf.V4Entries {
+		ep, _ := v4Entry.EntryProto()
+		dstIPs = append(dstIPs, strings.Split(ep.GetIpv4().GetPrefix(), "/")[0])
+	}
+	rxNames := []string{}
+	for i := 0; i < 16; i++ {
+		rxNames = append(rxNames, fmt.Sprintf(`dst%d.IPv4`, i))
+	}
+
+	top.Flows().Clear()
+	flow := top.Flows().Add().SetName("flow")
+	flow.Metrics().SetEnable(true)
+	flow.Size().SetFixed(512)
+	flow.Rate().SetPps(100)
+	flow.Duration().Continuous()
+	flow.TxRx().Device().
+		SetTxNames([]string{"src.IPv4"}).
+		SetRxNames(rxNames)
+	ethHeader := flow.Packet().Add().Ethernet()
+	ethHeader.Src().SetValue(atePort1.MAC)
+	v4 := flow.Packet().Add().Ipv4()
+	v4.Src().SetValue(atePort1.IPv4)
+	v4.Dst().SetValues(dstIPs)
+
+	ate.OTG().PushConfig(t, top)
+	ate.OTG().StartProtocols(t)
+	otgutils.WaitForARP(t, ate.OTG(), top, "flow")
+}
+
+func checkTraffic(t *testing.T, ate *ondatra.ATEDevice, top gosnappi.Config) {
+	ate.OTG().StartTraffic(t)
+	time.Sleep(time.Second * 30)
+	ate.OTG().StopTraffic(t)
+
+	otgutils.LogFlowMetrics(t, ate.OTG(), top)
+	otgutils.LogPortMetrics(t, ate.OTG(), top)
+
+	t.Log("Checking flow telemetry...")
+	recvMetric := gnmi.Get(t, ate.OTG(), gnmi.OTG().Flow("flow").State())
+	txPackets := recvMetric.GetCounters().GetOutPkts()
+	rxPackets := recvMetric.GetCounters().GetInPkts()
+	lostPackets := txPackets - rxPackets
+	lossPct := lostPackets * 100 / txPackets
+
+	if lossPct > 1 {
+		t.Errorf("FAIL- Got %v%% packet loss for %s ; expected < 1%%", lossPct, "flow")
+	}
+}
+
+// overrideScaleParams allows to override the default scale parameters based on the DUT vendor.
+func overrideScaleParams(dut *ondatra.DUTDevice) {
+	if deviations.OverrideDefaultNhScale(dut) {
+		if dut.Vendor() == ondatra.CISCO {
+			*fpargs.V4TunnelCount = 3328
+		}
+	}
 }

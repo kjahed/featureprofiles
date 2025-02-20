@@ -1,3 +1,6 @@
+# proto-file: github.com/openconfig/featureprofiles/proto/feature.proto
+# proto-message: FeatureProfile
+
 id {
   name: "lldp"
   version: 1
@@ -30,6 +33,9 @@ telemetry_path {
 telemetry_path {
   path: "/lldp/interfaces/interface/neighbors/neighbor/state/system-name"
 }
+config_path {
+  path: "/lldp/interfaces/interface/name"
+}
 telemetry_path {
   path: "/lldp/interfaces/interface/state/name"
 }
@@ -38,6 +44,9 @@ telemetry_path {
 }
 telemetry_path {
   path: "/lldp/state/chassis-id-type"
+}
+config_path {
+  path: "/lldp/config/system-name"
 }
 telemetry_path {
   path: "/lldp/state/system-name"

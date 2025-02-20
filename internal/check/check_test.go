@@ -62,9 +62,9 @@ func newFakeGNMI(ctx context.Context) (*fakeGNMI, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := grpc.DialContext(ctx, agent.Address(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(agent.Address(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, fmt.Errorf("DialContext(%s): %w", agent.Address(), err)
+		return nil, fmt.Errorf("NewClient(%s): %w", agent.Address(), err)
 	}
 
 	client, err := ygnmi.NewClient(gpb.NewGNMIClient(conn))
@@ -262,7 +262,7 @@ func TestAwait(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc+"/AwaitFor", func(t *testing.T) {
 			fakeGNMI.stubChildTwo(tc.updates...)
-			gotErr := tc.validator.AwaitFor(time.Millisecond*50, c)
+			gotErr := tc.validator.AwaitFor(time.Millisecond*500, c)
 			if len(tc.errIncludes) > 0 {
 				if err := errContainsAll(gotErr, tc.errIncludes); err != nil {
 					t.Error(err)
@@ -273,7 +273,7 @@ func TestAwait(t *testing.T) {
 		})
 		t.Run(tc.desc+"/AwaitUntil", func(t *testing.T) {
 			fakeGNMI.stubChildTwo(tc.updates...)
-			gotErr := tc.validator.AwaitUntil(time.Now().Add(time.Millisecond*50), c)
+			gotErr := tc.validator.AwaitUntil(time.Now().Add(time.Millisecond*500), c)
 			if len(tc.errIncludes) > 0 {
 				if err := errContainsAll(gotErr, tc.errIncludes); err != nil {
 					t.Error(err)

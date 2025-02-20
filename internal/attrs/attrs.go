@@ -34,14 +34,18 @@ import (
 // and for an ATETopology.  All fields are optional; only those that are
 // non-empty will be set when configuring an interface.
 type Attributes struct {
-	IPv4    string
-	IPv6    string
-	MAC     string
-	Name    string // Interface name, only applied to ATE ports.
-	Desc    string // Description, only applied to DUT interfaces.
-	IPv4Len uint8  // Prefix length for IPv4.
-	IPv6Len uint8  // Prefix length for IPv6.
-	MTU     uint16
+	IPv4         string
+	IPv4Sec      string // Secondary IPv4 address
+	IPv6         string
+	MAC          string
+	Name         string // Interface name, only applied to ATE ports.
+	Desc         string // Description, only applied to DUT interfaces.
+	Subinterface uint32 //Subinterface
+	IPv4Len      uint8  // Prefix length for IPv4.
+	IPv4LenSec   uint8  // Prefix length for Secondary IPv4 address.
+	IPv6Len      uint8  // Prefix length for IPv6.
+	MTU          uint16
+	ID           uint32 // /interfaces/interface/state/id p4rt interface id
 }
 
 // IPv4CIDR constructs the IPv4 CIDR notation with the given prefix
@@ -57,15 +61,15 @@ func (a *Attributes) IPv6CIDR() string {
 }
 
 // ConfigOCInterface configures an OpenConfig interface with these attributes.
-func (a *Attributes) ConfigOCInterface(intf *oc.Interface) *oc.Interface {
+func (a *Attributes) ConfigOCInterface(intf *oc.Interface, dut *ondatra.DUTDevice) *oc.Interface {
 	if a.Desc != "" {
 		intf.Description = ygot.String(a.Desc)
 	}
 	intf.Type = oc.IETFInterfaces_InterfaceType_ethernetCsmacd
-	if *deviations.InterfaceEnabled {
+	if deviations.InterfaceEnabled(dut) {
 		intf.Enabled = ygot.Bool(true)
 	}
-	if a.MTU > 0 && !*deviations.OmitL2MTU {
+	if a.MTU > 0 && !deviations.OmitL2MTU(dut) {
 		intf.Mtu = ygot.Uint16(a.MTU + 14)
 	}
 	e := intf.GetOrCreateEthernet()
@@ -73,10 +77,10 @@ func (a *Attributes) ConfigOCInterface(intf *oc.Interface) *oc.Interface {
 		e.MacAddress = ygot.String(a.MAC)
 	}
 
-	s := intf.GetOrCreateSubinterface(0)
+	s := intf.GetOrCreateSubinterface(a.Subinterface)
 	if a.IPv4 != "" {
 		s4 := s.GetOrCreateIpv4()
-		if *deviations.InterfaceEnabled && !*deviations.IPv4MissingEnabled {
+		if deviations.InterfaceEnabled(dut) && !deviations.IPv4MissingEnabled(dut) {
 			s4.Enabled = ygot.Bool(true)
 		}
 		if a.MTU > 0 {
@@ -88,12 +92,24 @@ func (a *Attributes) ConfigOCInterface(intf *oc.Interface) *oc.Interface {
 		}
 	}
 
+	if a.IPv4Sec != "" {
+		s4 := s.GetOrCreateIpv4()
+		if deviations.InterfaceEnabled(dut) && !deviations.IPv4MissingEnabled(dut) {
+			s4.Enabled = ygot.Bool(true)
+		}
+		a4 := s4.GetOrCreateAddress(a.IPv4Sec)
+		if a.IPv4LenSec > 0 {
+			a4.PrefixLength = ygot.Uint8(a.IPv4LenSec)
+			a4.Type = oc.IfIp_Ipv4AddressType_SECONDARY
+		}
+	}
+
 	if a.IPv6 != "" {
 		s6 := s.GetOrCreateIpv6()
 		if a.MTU > 0 {
 			s6.Mtu = ygot.Uint32(uint32(a.MTU))
 		}
-		if *deviations.InterfaceEnabled {
+		if deviations.InterfaceEnabled(dut) {
 			s6.Enabled = ygot.Bool(true)
 		}
 		a6 := s6.GetOrCreateAddress(a.IPv6)
@@ -105,8 +121,8 @@ func (a *Attributes) ConfigOCInterface(intf *oc.Interface) *oc.Interface {
 }
 
 // NewOCInterface returns a new *oc.Interface configured with these attributes.
-func (a *Attributes) NewOCInterface(name string) *oc.Interface {
-	return a.ConfigOCInterface(&oc.Interface{Name: ygot.String(name)})
+func (a *Attributes) NewOCInterface(name string, dut *ondatra.DUTDevice) *oc.Interface {
+	return a.ConfigOCInterface(&oc.Interface{Name: ygot.String(name)}, dut)
 }
 
 // AddToATE adds a new interface to an ATETopology with these attributes.
@@ -129,21 +145,23 @@ func (a *Attributes) AddToATE(top *ondatra.ATETopology, ap *ondatra.Port, peer *
 }
 
 // AddToOTG adds basic elements to a gosnappi configuration
-func (a *Attributes) AddToOTG(top gosnappi.Config, ap *ondatra.Port, peer *Attributes) {
+func (a *Attributes) AddToOTG(top gosnappi.Config, ap *ondatra.Port, peer *Attributes) gosnappi.Device {
 	top.Ports().Add().SetName(ap.ID())
 	dev := top.Devices().Add().SetName(a.Name)
-	eth := dev.Ethernets().Add().SetName(a.Name + ".Eth")
-	eth.SetPortName(ap.ID()).SetMac(a.MAC)
+	eth := dev.Ethernets().Add().SetName(a.Name + ".Eth").SetMac(a.MAC)
+	eth.Connection().SetPortName(ap.ID())
 
 	if a.MTU > 0 {
-		eth.SetMtu(int32(a.MTU))
+		eth.SetMtu(uint32(a.MTU))
 	}
 	if a.IPv4 != "" {
 		ip := eth.Ipv4Addresses().Add().SetName(dev.Name() + ".IPv4")
-		ip.SetAddress(a.IPv4).SetGateway(peer.IPv4).SetPrefix(int32(a.IPv4Len))
+		ip.SetAddress(a.IPv4).SetGateway(peer.IPv4).SetPrefix(uint32(a.IPv4Len))
 	}
 	if a.IPv6 != "" {
 		ip := eth.Ipv6Addresses().Add().SetName(dev.Name() + ".IPv6")
-		ip.SetAddress(a.IPv6).SetGateway(peer.IPv6).SetPrefix(int32(a.IPv6Len))
+		ip.SetAddress(a.IPv6).SetGateway(peer.IPv6).SetPrefix(uint32(a.IPv6Len))
 	}
+
+	return dev
 }

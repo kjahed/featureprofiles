@@ -1,0 +1,8 @@
+# proto-file: github.com/openconfig/kne/proto/topo.proto
+# proto-message: Topology
+name: "openconfig-lemming-dut"
+nodes: {
+    name: "dut"
+    vendor: OPENCONFIG
+    model: "LEMMING"
+}

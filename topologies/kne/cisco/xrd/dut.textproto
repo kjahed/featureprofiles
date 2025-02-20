@@ -1,0 +1,13 @@
+# proto-file: github.com/openconfig/kne/proto/topo.proto
+# proto-message: Topology
+name: "cisco-xrd-dut"
+nodes: {
+    name: "dut"
+    vendor: CISCO
+    model: "xrd"
+    os: "ios-xr"
+    config: {
+        image: "xrd:latest"
+        file: "config.cfg"
+    }
+}

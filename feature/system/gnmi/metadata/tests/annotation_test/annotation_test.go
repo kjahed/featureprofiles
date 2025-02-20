@@ -96,7 +96,10 @@ func TestGNMIMetadataAnnotation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Log(tc.desc)
-		gnmiClient := dut.RawAPIs().GNMI().Default(t)
+		gnmiClient := dut.RawAPIs().GNMI(t)
+		//Not assuming that hostname is already configured
+		hostnameConfigPath := gnmi.OC().System().Hostname()
+		gnmi.Replace(t, dut, hostnameConfigPath.Config(), string("ondatraHost"))
 
 		t.Log("Build an annotated gNMI SetRequest from proto message")
 		gpbSetRequest, err := buildMetadataAnnotation(t, tc.protoMsg)

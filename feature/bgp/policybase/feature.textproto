@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# proto-file: github.com/openconfig/featureprofiles/proto/feature.proto
+# proto-message: FeatureProfile
 
 id {
   name: "bgp_policybase"
@@ -61,9 +64,9 @@ telemetry_path {
   path: "/routing-policy/defined-sets/bgp-defined-sets/as-path-sets/as-path-set/state/as-path-set-name"
 }
 
-
-#prefix-set
-##prefix-set-name
+config_path {
+  path: "/routing-policy/defined-sets/prefix-sets/prefix-set/name"
+}
 config_path {
   path: "/routing-policy/defined-sets/prefix-sets/prefix-set/config/name"
 }
@@ -79,7 +82,14 @@ telemetry_path {
 }
 ##prefixes
 config_path {
+  path: "/routing-policy/defined-sets/prefix-sets/prefix-set/prefixes/prefix/ip-prefix"
+}
+config_path {
   path: "/routing-policy/defined-sets/prefix-sets/prefix-set/prefixes/prefix/config/ip-prefix"
+}
+
+config_path {
+  path: "/routing-policy/defined-sets/prefix-sets/prefix-set/prefixes/prefix/masklength-range"
 }
 config_path {
   path: "/routing-policy/defined-sets/prefix-sets/prefix-set/prefixes/prefix/config/masklength-range"
@@ -91,16 +101,19 @@ telemetry_path {
   path: "/routing-policy/defined-sets/prefix-sets/prefix-set/prefixes/prefix/state/masklength-range"
 }
 
-
-# Policy and statement name leaves
-##set-policy-name
+config_path {
+  path: "/routing-policy/policy-definitions/policy-definition/name"
+}
 config_path {
   path: "/routing-policy/policy-definitions/policy-definition/config/name"
 }
 telemetry_path {
   path: "/routing-policy/policy-definitions/policy-definition/state/name"
 }
-##set-statement-name
+
+config_path {
+  path: "/routing-policy/policy-definitions/policy-definition/statements/statement/name"
+}
 config_path {
   path: "/routing-policy/policy-definitions/policy-definition/statements/statement/config/name"
 }
